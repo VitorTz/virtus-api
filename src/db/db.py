@@ -1,0 +1,152 @@
+from fastapi.exceptions import HTTPException
+from fastapi import status
+from dotenv import load_dotenv
+from pathlib import Path
+from typing import TypeVar, Awaitable, Optional
+from src.exceptions import DatabaseError
+import asyncpg
+import os
+
+
+load_dotenv()
+
+
+
+class Database:
+    
+    def __init__(self):
+        self.pool: Optional[asyncpg.Pool] = None    
+        
+    async def version(self, conn: asyncpg.Connection) -> str:
+        return await conn.fetchval("SELECT version()")
+
+    async def execute_sql_file(self, path: Path, conn: asyncpg.Connection) -> None:
+        try:
+            if not path.exists():
+                print(f"[DB] [WARN] Schema file not found: {path}")
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                sql_commands = f.read()
+            await conn.execute(sql_commands)
+            print(f"[DB] [INFO] schema executado com sucesso: {path}")
+        except Exception as e:
+            print(f"[DB] [ERROR] Falha ao executar schema [{path}] | {e}")
+            
+    async def migrations(self, conn: asyncpg.Connection) -> None:
+        await self.execute_sql_file(Path("src/db/schema.sql"), conn)
+        await self.execute_sql_file(Path("src/db/rls.sql"), conn)
+        await self.execute_sql_file(Path("src/db/index.sql"), conn)
+
+    async def connect(self):
+        print("[DB] [INICIANDO CONEXÃO]")
+        try:
+            self.pool = await asyncpg.create_pool(
+                dsn=os.getenv("DATABASE_URL"),
+                min_size=1,
+                max_size=10,
+                command_timeout=60,
+                statement_cache_size=0 
+            )
+                    
+            async with self.pool.acquire() as conn:
+                print(f"[DB] [VERSÃO: {await self.version(conn)}]")
+                await self.migrations(conn)
+
+            print("[DB] [CONEXÃO ABERTA]")
+            
+        except Exception as e:
+            print(f"[DB] [ERROR] -> {e}")
+            raise e
+
+    async def disconnect(self):
+        if self.pool:
+            await self.pool.close()
+            print("[DB] [CONEXÃO ENCERRADA]")
+
+
+db = Database()
+
+
+async def get_db_pool() -> asyncpg.Pool:
+    """
+    Retorna o Pool de conexões do asyncpg.
+    Lança erro 500 se o banco ainda não tiver sido inicializado (connect).
+    """
+    if db.pool is None:
+        # Isso acontece se você tentar usar o banco antes do evento de startup do FastAPI
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="O Pool de conexão com o banco de dados não foi inicializado."
+        )
+    return db.pool
+
+
+T = TypeVar("T")
+
+ERROR_MAP = {
+    "users_email_unique_cstr": "Email já cadastrado.",
+    "users_cpf_unique_cstr": "CPF já cadastrado.",
+    "users_valid_cpf_cstr": "CPF está em formato inválido.",
+    "users_valid_phone_cstr": "Telefone está em formato inválido.",
+    "users_name_length_cstr": "Nome deve ter entre 2 e 256 caracteres.",
+    "users_nickname_length_cstr": "Apelido deve ter entre 2 e 256 caracteres.",
+    "users_notes_length_cstr": "Anotação deve ter entre 2 e 256 caracteres.",
+    "users_cpf_format": "CPF inválido.",
+    "users_phone_format": "Número de telefone inválido",
+    
+    "products_name_unique_cstr": "Nome de produto já cadastrado.",
+    "products_gtin_unique_cstr": "Código de barras já cadastrado.",
+    "products_sku_chk": "SKU já cadastrado.",
+
+    "recipes_quantity_valid": "Quantidade do ingrediente deve ser maior que 0.",
+    
+    "batches_batch_code_length_cstr": "O código do lote deve ser menor que 64 caracteres.",
+    "batches_quantity_valid": "O número de items no lote deve ser maior que  0.",
+    
+    "sale_items_greater_than_zero_cstr": "A quantidade de venda de um produto deve ser maior que 0.",
+    
+    "tab_payments_positive_amount": "O valor pago deve ser maior que 0.",
+    
+    "chk_log_level": "Tipo inválido de log",
+    
+    "user_feedbacks_message_length_cstr": "A mensagem de feedback deve ser menor que 512 caracteres.",
+    
+    "companies_unique_cnpj": "CNPJ já cadastrado.",
+    
+}
+
+
+async def _handle_asyncpg_errors(operation: Awaitable[T]) -> T:    
+    try:
+        return await operation
+    except asyncpg.exceptions.UniqueViolationError as e:
+        detail = ERROR_MAP.get(e.constraint_name, "Conflito de dados únicos.")
+        raise DatabaseError(code=status.HTTP_409_CONFLICT, detail=detail)
+    except asyncpg.exceptions.CheckViolationError as e:
+        detail = ERROR_MAP.get(e.constraint_name, "Dados inválidos.")
+        raise DatabaseError(code=status.HTTP_400_BAD_REQUEST, detail=detail)
+    except asyncpg.exceptions.InvalidTextRepresentationError as e:
+        msg = e.as_dict()['message']
+        role = msg.split(":")[1].strip()
+        if 'user_role_enum' in msg:
+            detail = ERROR_MAP.get(e.constraint_name, f"Função de usuário inválida ({role}).")
+        else:
+            detail = ERROR_MAP.get(e.constraint_name, "Dados inválidos.")
+        raise DatabaseError(code=status.HTTP_400_BAD_REQUEST, detail=detail)
+    except Exception as e:
+        if isinstance(e, HTTPException): raise e
+        raise DatabaseError(
+            code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail="Erro interno ao processar operação.", 
+            log_msg=f"{e}"
+        )
+
+
+async def db_safe_exec(*operations: Awaitable[T]) -> T | list[T]:
+    results = await _handle_asyncpg_errors(_execute_sequence(operations))
+    if len(results) == 1: return results[0]
+    return results
+
+
+async def _execute_sequence(operations):
+    return [await op for op in operations]

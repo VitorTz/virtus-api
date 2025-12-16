@@ -1,0 +1,6 @@
+This favicon was generated using the following font:
+
+- Font Title: Prompt
+- Font Author: undefined
+- Font Source: https://fonts.gstatic.com/s/prompt/v11/-W__XJnvUD7dzB26Z9AcZkIzeg.ttf
+- Font License: undefined)

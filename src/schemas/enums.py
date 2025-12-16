@@ -1,0 +1,46 @@
+from enum import Enum
+
+
+class PaymentMethod(str, Enum):
+    DINHEIRO = 'DINHEIRO'
+    CREDITO = 'CREDITO'
+    DEBITO = 'DEBITO'
+    PIX = 'PIX'
+    FIADO_EM_ABERTO = 'FIADO-EM-ABERTO'
+    FIADO_PAGO_PARCIAL = 'FIADO-PAGO-PARCIAL'
+    FIADO_QUITADO = 'FIADO-QUITADO'
+    VALE_ALIMENTACAO = 'VALE_ALIMENTACAO'
+
+
+class StockMovementType(str, Enum):
+    VENDA = 'VENDA'
+    COMPRA = 'COMPRA'
+    DEVOLUCAO_VENDA = 'DEVOLUCAO_VENDA'
+    DEVOLUCAO_FORNECEDOR = 'DEVOLUCAO_FORNECEDOR'
+    PERDA = 'PERDA'
+    AJUSTE = 'AJUSTE'
+    CONSUMO_INTERNO = 'CONSUMO_INTERNO'
+    CANCELAMENTO = 'CANCELAMENTO'
+
+
+class UserRole(str, Enum):
+    ADMIN = 'ADMIN'
+    CAIXA = 'CAIXA'
+    GERENTE = 'GERENTE'
+    CLIENTE = 'CLIENTE'
+    ESTOQUISTA = 'ESTOQUISTA'
+    CONTADOR = 'CONTADOR'
+
+
+class SaleStatus(str, Enum):
+    ABERTA = 'ABERTA'
+    CONCLUIDA = 'CONCLUIDA'
+    CANCELADA = 'CANCELADA'
+    EM_ENTREGA = 'EM_ENTREGA'
+
+
+class MeasureUnit(str, Enum):
+    UN = 'UN'
+    KG = 'KG'
+    L = 'L'
+    CX = 'CX'

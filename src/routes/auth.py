@@ -53,6 +53,6 @@ async def refresh(
 async def logout(
     response: Response,
     refresh_token: Optional[str] = Cookie(default=None),
-    conn: Connection = Connection(get_postgres_connection)
+    conn: Connection = Depends(get_postgres_connection)
 ):
     await auth.logout(refresh_token, response, conn)

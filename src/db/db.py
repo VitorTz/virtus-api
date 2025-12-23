@@ -1,7 +1,6 @@
 from fastapi.exceptions import HTTPException
 from fastapi import status
 from dotenv import load_dotenv
-from pathlib import Path
 from typing import TypeVar, Awaitable, Optional
 from src.exceptions import DatabaseError
 import asyncpg
@@ -12,56 +11,51 @@ load_dotenv()
 
 
 class Database:
+
     
     def __init__(self):
-        self.pool: Optional[asyncpg.Pool] = None    
-        
+        self.pool: Optional[asyncpg.Pool] = None
+    
     async def version(self, conn: asyncpg.Connection) -> str:
         return await conn.fetchval("SELECT version()")
-
-    async def execute_sql_file(self, path: Path, conn: asyncpg.Connection) -> None:
-        try:
-            if not path.exists():
-                print(f"[DB] [WARN] Schema file not found: {path}")
-                return
-            with open(path, "r", encoding="utf-8") as f:
-                sql_commands = f.read()
-            await conn.execute(sql_commands)
-            print(f"[DB] [INFO] schema executado com sucesso: {path}")
-        except Exception as e:
-            print(f"[DB] [ERROR] Falha ao executar schema [{path}] | {e}")
-            
-    async def migrations(self, conn: asyncpg.Connection) -> None:
-        await self.execute_sql_file(Path("src/db/schema.sql"), conn)
-        # await self.execute_sql_file(Path("src/db/rls.sql"), conn)
-        # await self.execute_sql_file(Path("src/db/view.sql"), conn)
-
+    
     async def connect(self):
-        print("[DB] [INICIANDO CONEXÃO]")
+        print("[DB] [INFO]", "[INICIANDO CONEXÃO]")
+        
         try:
             self.pool = await asyncpg.create_pool(
                 dsn=os.getenv("DATABASE_URL"),
-                min_size=1,
-                max_size=10,
+                min_size=2,
+                max_size=20,
                 command_timeout=60,
-                statement_cache_size=0 
-            )
-                    
-            async with self.pool.acquire() as conn:
-                print(f"[DB] [VERSÃO: {await self.version(conn)}]")
-                await self.migrations(conn)
+                statement_cache_size=0,
+                timeout=30,
+                max_inactive_connection_lifetime=300
+            )                    
 
-            print("[DB] [CONEXÃO ABERTA]")
+            print("[DB] [INFO]", "[CONEXÃO ABERTA]")
             
         except Exception as e:
-            print(f"[DB] [ERROR] -> {e}")
-            raise e
-
-    async def disconnect(self):
+            print("[DB] [ERROR]", f"[FALHA AO CONECTAR: {e}]")
+            raise
+    
+    async def disconnect(self):        
         if self.pool:
-            await self.pool.close()
-            print("[DB] [CONEXÃO ENCERRADA]")
-
+            try:
+                await self.pool.close()
+            except Exception as e:
+                print("[DB] [ERROR]", f"[ERRO AO ENCERRAR CONEXÃO: {e}]")
+            print("[DB] [INFO]", "[CONEXÃO ENCERRADA]")
+    
+    async def health_check(self) -> bool:
+        if not self.pool: return False        
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            return True
+        except Exception:
+            return False
+        
 
 db = Database()
 

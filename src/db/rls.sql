@@ -75,6 +75,14 @@ $$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
 CREATE OR REPLACE FUNCTION fn_set_tenant_and_creator()
 RETURNS TRIGGER AS $$
 BEGIN
+
+    -- 1. Verifica se o usuário da sessão é 'postgres'.
+    -- Se for, retorna NEW imediatamente, permitindo que o admin
+    -- insira ou atualize dados manualmente (útil para backup/restore e seeds).
+    IF SESSION_USER = 'postgres' THEN
+        RETURN NEW;
+    END IF;
+
     -- Define tenant_id do usuário atual (não pode ser alterado depois)
     IF TG_OP = 'INSERT' THEN
         NEW.tenant_id := current_user_tenant_id();
@@ -96,6 +104,14 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;
 CREATE OR REPLACE FUNCTION fn_set_tenant()
 RETURNS TRIGGER AS $$
 BEGIN
+
+    -- 1. Verifica se o usuário da sessão é 'postgres'.
+    -- Se for, retorna NEW imediatamente, permitindo que o admin
+    -- insira ou atualize dados manualmente (útil para backup/restore e seeds).
+    IF SESSION_USER = 'postgres' THEN
+        RETURN NEW;
+    END IF;
+
     -- Define tenant_id do usuário atual (não pode ser alterado depois)
     IF TG_OP = 'INSERT' THEN
         NEW.tenant_id := current_user_tenant_id();
@@ -155,31 +171,64 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;
 
 -- Função para garantir que sempre existe pelo menos um ADMIN
 CREATE OR REPLACE FUNCTION fn_ensure_at_least_one_admin()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER SECURITY DEFINER AS $$
 DECLARE
     admin_count INTEGER;
+    is_removing_admin_privilege BOOLEAN := FALSE;
 BEGIN
-    IF TG_OP = 'DELETE' OR TG_OP = 'UPDATE' THEN
-        -- Verifica se é um ADMIN sendo removido/alterado
-        IF 'ADMIN' = ANY(OLD.roles) THEN
-            -- Conta quantos ADMINs restam no tenant
-            SELECT COUNT(*) INTO admin_count
+    
+    IF SESSION_USER = 'postgres' THEN
+        IF TG_OP = 'DELETE' THEN 
+            RETURN OLD; 
+        ELSE 
+            RETURN NEW; 
+        END IF;
+    END IF;
+
+    -- ========================================================================
+    -- LÓGICA PARA MORTAIS
+    -- ========================================================================
+    
+    -- Se não era ADMIN antes, não precisamos nos preocupar
+    IF NOT ('ADMIN' = ANY(OLD.roles)) THEN
+        RETURN COALESCE(NEW, OLD);
+    END IF;
+
+    -- Lógica para detectar se estamos PERDENDO um Admin
+    IF TG_OP = 'DELETE' THEN
+        is_removing_admin_privilege := TRUE;
+    ELSIF TG_OP = 'UPDATE' THEN
+        -- Só consideramos perigoso se:
+        -- 1. A role 'ADMIN' foi removida do array novo
+        -- 2. OU o usuário está sendo inativado
+        IF NOT ('ADMIN' = ANY(NEW.roles)) OR (NEW.is_active = FALSE) THEN
+            is_removing_admin_privilege := TRUE;
+        END IF;
+    END IF;
+
+    -- Se detectamos perigo, fazemos a contagem cara (Count)
+    IF is_removing_admin_privilege THEN
+        SELECT COUNT(*) INTO admin_count
             FROM users
-            WHERE tenant_id = OLD.tenant_id
-              AND 'ADMIN' = ANY(roles)
-              AND is_active = TRUE
-              AND id != OLD.id;
-            
-            IF admin_count = 0 THEN
-                RAISE EXCEPTION 'Não é possível remover o último ADMIN do tenant. Deve existir pelo menos um ADMIN ativo.';
-            END IF;
+        WHERE tenant_id = OLD.tenant_id
+            AND 'ADMIN' = ANY(roles)
+            AND is_active = TRUE
+            AND id != OLD.id
+        FOR UPDATE;
+        
+        IF admin_count = 0 THEN
+            RAISE EXCEPTION 'Não é possível remover o último ADMIN do tenant. Deve existir pelo menos um ADMIN ativo.';
         END IF;
     END IF;
     
-    RETURN COALESCE(NEW, OLD);
+    -- Retorno padrão de triggers
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    ELSE
+        RETURN NEW;
+    END IF;
 END;
 $$ LANGUAGE plpgsql;
-
 
 -- ============================================================================
 -- TRIGGERS
@@ -273,11 +322,37 @@ FOR EACH ROW EXECUTE FUNCTION fn_set_tenant_and_creator();
 
 
 -- ============================================================================
+-- IBPT VERSIONS
+-- ============================================================================
+
+ALTER TABLE ibpt_versions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ibpt_versions FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS ibpt_versions_read_policy ON ibpt_versions;
+CREATE POLICY ibpt_versions_read_policy ON ibpt_versions 
+    FOR SELECT 
+    USING (true);
+
+-- ============================================================================
+-- FISCAL NCMS
+-- ============================================================================
+
+ALTER TABLE fiscal_ncms ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fiscal_ncms FORCE ROW LEVEL SECURITY;
+
+-- [SELECT]: Leitura pública
+DROP POLICY IF EXISTS fiscal_ncms_public_read ON fiscal_ncms;
+CREATE POLICY fiscal_ncms_public_read ON fiscal_ncms
+    FOR SELECT
+    USING (true);
+
+-- ============================================================================
 -- TENANTS
 -- ============================================================================
 
 ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY tenants_select_policy ON tenants;
 CREATE POLICY tenants_select_policy ON tenants
     FOR SELECT
     USING (id = current_user_tenant_id());
@@ -291,6 +366,7 @@ ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE users FORCE ROW LEVEL SECURITY;
 
 -- SELECT: Todos veem clientes, nível de privilégio >= 80 vê tudo
+DROP POLICY users_select_policy ON users;
 CREATE POLICY users_select_policy ON users
     FOR SELECT
     USING (
@@ -305,6 +381,7 @@ CREATE POLICY users_select_policy ON users
     );
 
 -- INSERT: Apenas ADMIN/GERENTE criam contas, exceto CLIENTE (todos podem criar clientes)
+DROP POLICY users_insert_policy ON users;
 CREATE POLICY users_insert_policy ON users
     FOR INSERT
     WITH CHECK (        
@@ -323,6 +400,7 @@ CREATE POLICY users_insert_policy ON users
     );
 
 -- UPDATE: Mesmas regras do INSERT + usuário pode atualizar a si mesmo
+DROP POLICY users_update_policy ON users;
 CREATE POLICY users_update_policy ON users
     FOR UPDATE
     USING (
@@ -349,6 +427,7 @@ CREATE POLICY users_update_policy ON users
     );
 
 -- DELETE
+DROP POLICY users_delete_policy ON users;
 CREATE POLICY users_delete_policy ON users
     FOR DELETE
     USING (
@@ -407,6 +486,7 @@ ALTER TABLE suppliers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE suppliers FORCE ROW LEVEL SECURITY;
 
 -- Qualquer funcionário pode ver
+DROP POLICY IF EXISTS suppliers_select_policy ON suppliers;
 CREATE POLICY suppliers_select_policy ON suppliers
     FOR SELECT
     USING (
@@ -415,6 +495,7 @@ CREATE POLICY suppliers_select_policy ON suppliers
     );
 
 -- Apenas Compradores (60) ou superior podem cadastrar novos fornecedores.
+DROP POLICY IF EXISTS suppliers_insert_policy ON suppliers;
 CREATE POLICY suppliers_insert_policy ON suppliers
     FOR INSERT
     WITH CHECK (
@@ -422,6 +503,7 @@ CREATE POLICY suppliers_insert_policy ON suppliers
         AND current_user_max_privilege() >= 60 
     );
 
+DROP POLICY IF EXISTS suppliers_update_policy ON suppliers;
 CREATE POLICY suppliers_update_policy ON suppliers
     FOR UPDATE
     USING (
@@ -435,6 +517,7 @@ CREATE POLICY suppliers_update_policy ON suppliers
 
 -- Apenas Gerente (99) e Admin (120) podem remover fornecedores.
 -- Isso evita que um Comprador apague um fornecedor importante por erro ou malícia.
+DROP POLICY IF EXISTS suppliers_delete_policy ON suppliers;
 CREATE POLICY suppliers_delete_policy ON suppliers
     FOR DELETE
     USING (
@@ -451,6 +534,7 @@ ALTER TABLE tax_groups ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tax_groups FORCE ROW LEVEL SECURITY;
 
 -- [SELECT] [>= 20] (TODOS MENOS CLIENTES)
+DROP POLICY IF EXISTS tax_groups_select_policy ON tax_groups;
 CREATE POLICY tax_groups_select_policy ON tax_groups
     FOR SELECT
     USING (
@@ -459,6 +543,7 @@ CREATE POLICY tax_groups_select_policy ON tax_groups
     );
 
 -- [INSERT] [>= 80] (ADMIN, GERENTE, FINANCEIRO, CONTADOR)
+DROP POLICY IF EXISTS tax_groups_insert_policy ON tax_groups;
 CREATE POLICY tax_groups_insert_policy ON tax_groups
     FOR INSERT
     WITH CHECK (
@@ -467,6 +552,7 @@ CREATE POLICY tax_groups_insert_policy ON tax_groups
     );
 
 -- [UPDATE] [>= 80] (ADMIN, GERENTE, FINANCEIRO, CONTADOR)
+DROP POLICY IF EXISTS tax_groups_update_policy ON tax_groups;
 CREATE POLICY tax_groups_update_policy ON tax_groups
     FOR UPDATE
     USING (
@@ -480,6 +566,7 @@ CREATE POLICY tax_groups_update_policy ON tax_groups
 
 
 -- [DELETE] [>= 99] (ADMIN, GERENTE)
+DROP POLICY IF EXISTS tax_groups_delete_policy ON tax_groups;
 CREATE POLICY tax_groups_delete_policy ON tax_groups
     FOR DELETE
     USING (
@@ -495,11 +582,13 @@ ALTER TABLE products ENABLE ROW LEVEL SECURITY;
 ALTER TABLE products FORCE ROW LEVEL SECURITY;
 
 -- [SELECT] [TODOS DO MESMO TENANT]
+DROP POLICY IF EXISTS products_select_policy ON products;
 CREATE POLICY products_select_policy ON products
     FOR SELECT
     USING (tenant_id = current_user_tenant_id());
 
 -- [INSERT] [>= 60]
+DROP POLICY IF EXISTS products_insert_policy ON products;
 CREATE POLICY products_insert_policy ON products
     FOR INSERT
     WITH CHECK (
@@ -508,6 +597,7 @@ CREATE POLICY products_insert_policy ON products
     );
 
 -- [UPDATE] [>= 60]
+DROP POLICY IF EXISTS products_update_policy ON products;
 CREATE POLICY products_update_policy ON products
     FOR UPDATE
     USING (
@@ -519,6 +609,7 @@ CREATE POLICY products_update_policy ON products
     );
 
 -- [DELETE] [>= 92] (ADMIN, GERENTE, FINANCEIRO)
+DROP POLICY IF EXISTS products_delete_policy ON products;
 CREATE POLICY products_delete_policy ON products
     FOR DELETE
     USING (
@@ -534,6 +625,7 @@ ALTER TABLE product_compositions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE product_compositions FORCE ROW LEVEL SECURITY;
 
 -- [SELECT] (Todos os funcionários)
+DROP POLICY IF EXISTS compositions_select_policy ON product_compositions;
 CREATE POLICY compositions_select_policy ON product_compositions
     FOR SELECT
     USING (
@@ -542,6 +634,7 @@ CREATE POLICY compositions_select_policy ON product_compositions
     );
 
 -- [INSERT]
+DROP POLICY IF EXISTS compositions_insert_policy ON product_compositions;
 CREATE POLICY compositions_insert_policy ON product_compositions
     FOR INSERT
     WITH CHECK (
@@ -550,6 +643,7 @@ CREATE POLICY compositions_insert_policy ON product_compositions
     );
 
 -- [INSERT]
+DROP POLICY IF EXISTS compositions_update_policy ON product_compositions;
 CREATE POLICY compositions_update_policy ON product_compositions
     FOR UPDATE
     USING (
@@ -561,6 +655,7 @@ CREATE POLICY compositions_update_policy ON product_compositions
     );
 
 -- [DELETE]
+DROP POLICY IF EXISTS compositions_delete_policy ON product_compositions;
 CREATE POLICY compositions_delete_policy ON product_compositions
     FOR DELETE
     USING (
@@ -577,6 +672,7 @@ ALTER TABLE product_modifier_groups ENABLE ROW LEVEL SECURITY;
 ALTER TABLE product_modifier_groups FORCE ROW LEVEL SECURITY;
 
 -- [SELECT] (Todos os funcionários do mesmo tenant)
+DROP POLICY IF EXISTS modifier_groups_select_policy ON product_modifier_groups;
 CREATE POLICY modifier_groups_select_policy ON product_modifier_groups
     FOR SELECT
     USING (
@@ -585,6 +681,7 @@ CREATE POLICY modifier_groups_select_policy ON product_modifier_groups
     );
 
 
+DROP POLICY IF EXISTS modifier_groups_insert_policy ON product_modifier_groups;
 CREATE POLICY modifier_groups_insert_policy ON product_modifier_groups
     FOR INSERT
     WITH CHECK (
@@ -592,7 +689,7 @@ CREATE POLICY modifier_groups_insert_policy ON product_modifier_groups
         AND current_user_max_privilege() >= 60
     );
 
-
+DROP POLICY IF EXISTS modifier_groups_update_policy ON product_modifier_groups;
 CREATE POLICY modifier_groups_update_policy ON product_modifier_groups
     FOR UPDATE
     USING (
@@ -604,6 +701,7 @@ CREATE POLICY modifier_groups_update_policy ON product_modifier_groups
     );
 
 
+DROP POLICY IF EXISTS modifier_groups_delete_policy ON product_modifier_groups;
 CREATE POLICY modifier_groups_delete_policy ON product_modifier_groups
     FOR DELETE
     USING (
@@ -620,6 +718,7 @@ ALTER TABLE batches FORCE ROW LEVEL SECURITY;
 
 
 -- [SELECT] Todos os funcionários podem ver
+DROP POLICY IF EXISTS batches_select_policy ON batches;
 CREATE POLICY batches_select_policy ON batches
     FOR SELECT
     USING (
@@ -628,6 +727,7 @@ CREATE POLICY batches_select_policy ON batches
     );
 
 -- [INSERT] [>= 40]
+DROP POLICY IF EXISTS batches_insert_policy ON batches;
 CREATE POLICY batches_insert_policy ON batches
     FOR INSERT
     WITH CHECK (
@@ -636,6 +736,7 @@ CREATE POLICY batches_insert_policy ON batches
     );
 
 -- [UPDATE] [>= 40]
+DROP POLICY IF EXISTS batches_update_policy ON batches;
 CREATE POLICY batches_update_policy ON batches
     FOR UPDATE
     USING (
@@ -647,6 +748,7 @@ CREATE POLICY batches_update_policy ON batches
     );
 
 
+DROP POLICY IF EXISTS batches_delete_policy ON batches;
 CREATE POLICY batches_delete_policy ON batches
     FOR DELETE
     USING (
@@ -663,14 +765,17 @@ ALTER TABLE addresses FORCE ROW LEVEL SECURITY;
 
 
 -- Tabela compartilhada (cache de CEPs)
+DROP POLICY IF EXISTS addresses_public_read ON addresses;
 CREATE POLICY addresses_public_read ON addresses
     FOR SELECT
     USING (true);
 
+DROP POLICY IF EXISTS addresses_public_write ON addresses;
 CREATE POLICY addresses_public_write ON addresses
     FOR INSERT
     WITH CHECK (true);
 
+DROP POLICY IF EXISTS addresses_public_update ON addresses;
 CREATE POLICY addresses_public_update ON addresses
     FOR UPDATE
     USING (true);
@@ -685,6 +790,7 @@ ALTER TABLE user_addresses FORCE ROW LEVEL SECURITY;
 
 
 -- [SELECT]
+DROP POLICY IF EXISTS user_addresses_select_policy ON user_addresses;
 CREATE POLICY user_addresses_select_policy ON user_addresses
     FOR SELECT
     USING (
@@ -697,6 +803,7 @@ CREATE POLICY user_addresses_select_policy ON user_addresses
     );
 
 -- [INSERT]
+DROP POLICY IF EXISTS user_addresses_insert_policy ON user_addresses;
 CREATE POLICY user_addresses_insert_policy ON user_addresses
     FOR INSERT
     WITH CHECK (
@@ -709,6 +816,7 @@ CREATE POLICY user_addresses_insert_policy ON user_addresses
     );
 
 -- [UDPATE]
+DROP POLICY IF EXISTS user_addresses_update_policy ON user_addresses;
 CREATE POLICY user_addresses_update_policy ON user_addresses
     FOR UPDATE
     USING (
@@ -724,6 +832,7 @@ CREATE POLICY user_addresses_update_policy ON user_addresses
     );
 
 -- [DELETE] [>= 70]
+DROP POLICY IF EXISTS user_addresses_delete_policy ON user_addresses;
 CREATE POLICY user_addresses_delete_policy ON user_addresses
     FOR DELETE
     USING (
@@ -742,6 +851,13 @@ CREATE POLICY user_addresses_delete_policy ON user_addresses
 ALTER TABLE refresh_tokens ENABLE ROW LEVEL SECURITY;
 ALTER TABLE refresh_tokens FORCE ROW LEVEL SECURITY;
 
+-- [SELECT] Usuário vê os próprios tokens
+DROP POLICY IF EXISTS refresh_tokens_own_access ON refresh_tokens;
+CREATE POLICY refresh_tokens_own_access ON refresh_tokens
+    FOR ALL
+    USING (user_id = current_user_id())
+    WITH CHECK (user_id = current_user_id());
+
 
 -- ============================================================================
 -- PRICE_AUDITS
@@ -751,6 +867,7 @@ ALTER TABLE price_audits ENABLE ROW LEVEL SECURITY;
 ALTER TABLE price_audits FORCE ROW LEVEL SECURITY;
 
 -- Apenas leitura, todos veem do seu tenant
+DROP POLICY IF EXISTS price_audits_select_policy ON price_audits;
 CREATE POLICY price_audits_select_policy ON price_audits
     FOR SELECT
     USING (
@@ -765,6 +882,7 @@ ALTER TABLE stock_movements ENABLE ROW LEVEL SECURITY;
 ALTER TABLE stock_movements FORCE ROW LEVEL SECURITY;
 
 
+DROP POLICY IF EXISTS stock_movements_select_policy ON stock_movements;
 CREATE POLICY stock_movements_select_policy ON stock_movements
     FOR SELECT
     USING (
@@ -773,6 +891,7 @@ CREATE POLICY stock_movements_select_policy ON stock_movements
     );
 
 
+DROP POLICY IF EXISTS stock_movements_insert_policy ON stock_movements;
 CREATE POLICY stock_movements_insert_policy ON stock_movements
     FOR INSERT
     WITH CHECK (
@@ -781,16 +900,31 @@ CREATE POLICY stock_movements_insert_policy ON stock_movements
     );
 
 
+DROP POLICY IF EXISTS stock_movements_update_policy ON stock_movements;
 CREATE POLICY stock_movements_update_policy ON stock_movements
     FOR UPDATE
     USING (false) -- Sempre Falso = Ninguém passa
     WITH CHECK (false);
 
 
+DROP POLICY IF EXISTS stock_movements_delete_policy ON stock_movements;
 CREATE POLICY stock_movements_delete_policy ON stock_movements
     FOR DELETE
     USING (false); -- Sempre Falso
 
+
+-- ============================================================================
+-- FISCAL SEQUENCES
+-- ============================================================================
+-- RLS para Segurança (Ninguém vê a sequência do vizinho)
+ALTER TABLE fiscal_sequences ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fiscal_sequences FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS fiscal_sequences_isolation ON fiscal_sequences;
+CREATE POLICY fiscal_sequences_isolation ON fiscal_sequences
+    FOR ALL
+    USING (tenant_id = current_user_tenant_id())
+    WITH CHECK (tenant_id = current_user_tenant_id());
 
 -- ============================================================================
 -- SALES
@@ -802,6 +936,7 @@ ALTER TABLE sales FORCE ROW LEVEL SECURITY;
 -- [SELECT]
 -- 1. Cliente (0): Apenas as compras que ELE fez (customer_id = seu_id).
 -- 2. Equipe Operacional (20+): Cozinha (30) precisa ver o pedido, Entregador (20) também.
+DROP POLICY IF EXISTS sales_select_policy ON sales;
 CREATE POLICY sales_select_policy ON sales
     FOR SELECT
     USING (
@@ -817,6 +952,7 @@ CREATE POLICY sales_select_policy ON sales
 
 -- [INSERT]
 -- 2. Frente de Loja (50+): Garçom, Vendedor, Caixa.
+DROP POLICY IF EXISTS sales_insert_policy ON sales;
 CREATE POLICY sales_insert_policy ON sales
     FOR INSERT
     WITH CHECK (
@@ -825,25 +961,40 @@ CREATE POLICY sales_insert_policy ON sales
     );
 
 -- [UPDATE]
--- 1. Equipe de Vendas (50+): Pode adicionar itens, mudar status para 'PAGO'.
--- 2. Fiscal/Gerente (70+): Pode alterar status para 'CANCELADO'.
+DROP POLICY IF EXISTS sales_update_policy ON sales;
 CREATE POLICY sales_update_policy ON sales
     FOR UPDATE
+    -- USING: Define QUEM pode tocar em QUAL linha (Estado Atual)
     USING (
         tenant_id = current_user_tenant_id()
-        AND current_user_max_privilege() >= 50 -- Apenas Vendedores/Caixas pra cima
+        AND (
+            -- Cenário 1: Gerentes (99+) podem tocar em QUALQUER venda (concluída ou não)
+            current_user_max_privilege() >= 99
+            OR
+            -- Cenário 2: Vendedores/Caixas (50+) SÓ podem tocar em vendas ABERTAS/EM ANDAMENTO
+            (
+                current_user_max_privilege() >= 50 
+                AND 
+                status NOT IN ('CONCLUIDA', 'CANCELADA') -- Aqui bloqueamos a edição do que já passou
+            )
+        )
     )
+    -- WITH CHECK: Define o que a linha pode SE TORNAR (Estado Futuro/Novo)
     WITH CHECK (
         tenant_id = current_user_tenant_id()
         AND (
-            -- BLOQUEIO DE CANCELAMENTO PARA NÍVEIS BAIXOS
-            -- Se o status for 'CANCELLED', o usuário TEM que ser Nível 70+ (Fiscal)
-            -- Se for qualquer outro status, Nível 50+ basta.
-            (status <> 'CANCELADA' OR current_user_max_privilege() >= 70)
+            -- Cenário A: Gerentes fazem o que quiserem
+            current_user_max_privilege() >= 99
+            OR
+            (
+                -- Não podem transformar a venda em 'CANCELADA' a menos que sejam Fiscais (70+)
+                (status <> 'CANCELADA' OR current_user_max_privilege() >= 70)                
+            )
         )
     );
 
 -- [DELETE] Apenas ADMIN pode deletar vendas
+DROP POLICY IF EXISTS sales_delete_policy ON sales;
 CREATE POLICY sales_delete_policy ON sales
     FOR DELETE
     USING (
@@ -859,6 +1010,7 @@ ALTER TABLE sale_items ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sale_items FORCE ROW LEVEL SECURITY;
 
 -- [SELECT]
+DROP POLICY IF EXISTS sale_items_select_policy ON sale_items;
 CREATE POLICY sale_items_select_policy ON sale_items
     FOR SELECT
     USING (
@@ -867,6 +1019,7 @@ CREATE POLICY sale_items_select_policy ON sale_items
     );
 
 -- [INSERT] Apenas para equipe vendas e seus superiores
+DROP POLICY IF EXISTS sale_items_insert_policy ON sale_items;
 CREATE POLICY sale_items_insert_policy ON sale_items
     FOR INSERT
     WITH CHECK (
@@ -877,6 +1030,7 @@ CREATE POLICY sale_items_insert_policy ON sale_items
     );
 
 -- [UPDATE] Apenas para equipe vendas e seus superiores
+DROP POLICY IF EXISTS sale_items_update_policy ON sale_items;
 CREATE POLICY sale_items_update_policy ON sale_items
     FOR UPDATE
     USING (
@@ -889,6 +1043,7 @@ CREATE POLICY sale_items_update_policy ON sale_items
 
 
 -- [DELETE] Funcionário (50+): Cancela item errado antes de fechar a conta.
+DROP POLICY IF EXISTS sale_items_delete_policy ON sale_items;
 CREATE POLICY sale_items_delete_policy ON sale_items
     FOR DELETE
     USING (
@@ -913,7 +1068,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trg_sale_items_protect_columns
+CREATE OR REPLACE TRIGGER trg_sale_items_protect_columns
 BEFORE UPDATE ON sale_items
 FOR EACH ROW EXECUTE FUNCTION protect_sensitive_sale_columns();
 
@@ -925,6 +1080,7 @@ ALTER TABLE sale_payments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sale_payments FORCE ROW LEVEL SECURITY;
 
 -- [SELECT] Todos os funcionários podem ver
+DROP POLICY IF EXISTS sale_payments_select_policy ON sale_payments;
 CREATE POLICY sale_payments_select_policy ON sale_payments
     FOR SELECT
     USING (
@@ -933,6 +1089,7 @@ CREATE POLICY sale_payments_select_policy ON sale_payments
     );
 
 -- [INSERT] Equipe de vendas e seus superiores podem inserir
+DROP POLICY IF EXISTS sale_payments_insert_policy ON sale_payments;
 CREATE POLICY sale_payments_insert_policy ON sale_payments
     FOR INSERT
     WITH CHECK (
@@ -941,6 +1098,7 @@ CREATE POLICY sale_payments_insert_policy ON sale_payments
     );
 
 -- [UPDATE] Apenas ADMIN pode atualizar
+DROP POLICY IF EXISTS sale_payments_update_policy ON sale_payments;
 CREATE POLICY sale_payments_update_policy ON sale_payments
     FOR UPDATE
     USING (
@@ -952,6 +1110,7 @@ CREATE POLICY sale_payments_update_policy ON sale_payments
     );
 
 -- [DELETE] Equipe fiscal e seus superiores podem deletar
+DROP POLICY IF EXISTS sale_payments_delete_policy ON sale_payments;
 CREATE POLICY sale_payments_delete_policy ON sale_payments
     FOR DELETE
     USING (
@@ -981,6 +1140,7 @@ ALTER TABLE security_audit_log ENABLE ROW LEVEL SECURITY;
 ALTER TABLE security_audit_log FORCE ROW LEVEL SECURITY;
 
 -- [ALL] Manter tenant_id
+DROP POLICY IF EXISTS security_audit_log_tenant_isolation ON security_audit_log;
 CREATE POLICY security_audit_log_tenant_isolation ON security_audit_log
     FOR ALL
     USING (tenant_id = current_user_tenant_id())
@@ -988,6 +1148,7 @@ CREATE POLICY security_audit_log_tenant_isolation ON security_audit_log
 
 
 -- [SELECT] ADMIN pode ver audit logs
+DROP POLICY IF EXISTS security_audit_log_select_policy ON security_audit_log;
 CREATE POLICY security_audit_log_select_policy ON security_audit_log
     FOR SELECT
     USING (
@@ -996,11 +1157,20 @@ CREATE POLICY security_audit_log_select_policy ON security_audit_log
     );
 
 -- [INSERT] Sistema insere automaticamente
+DROP POLICY IF EXISTS security_audit_log_insert_policy ON security_audit_log;
 CREATE POLICY security_audit_log_insert_policy ON security_audit_log
     FOR INSERT
     WITH CHECK (tenant_id = current_user_tenant_id());
 
 -- [DELETE/UPDATE] Ninguém pode deletar ou atualizar 
+
+DROP POLICY IF EXISTS security_audit_log_immutable ON security_audit_log;
+CREATE POLICY security_audit_log_immutable ON security_audit_log
+    FOR UPDATE USING (false);
+
+DROP POLICY IF EXISTS security_audit_log_no_delete ON security_audit_log;
+CREATE POLICY security_audit_log_no_delete ON security_audit_log
+    FOR DELETE USING (false);
 
 
 -- ============================================================================
@@ -1011,22 +1181,11 @@ ALTER TABLE fiscal_payment_codes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE fiscal_payment_codes FORCE ROW LEVEL SECURITY;
 
 -- [SELECT] Leitura pública
+DROP POLICY IF EXISTS fiscal_payment_codes_public_read ON fiscal_payment_codes;
 CREATE POLICY fiscal_payment_codes_public_read ON fiscal_payment_codes
     FOR SELECT
     USING (true);
 
-
--- ============================================================================
--- FISCAL NCMS
--- ============================================================================
-
-ALTER TABLE fiscal_ncms ENABLE ROW LEVEL SECURITY;
-ALTER TABLE fiscal_ncms FORCE ROW LEVEL SECURITY;
-
--- [SELECT]: Leitura pública
-CREATE POLICY fiscal_ncms_public_read ON fiscal_ncms
-    FOR SELECT
-    USING (true);
 
 
 -- ============================================================================
@@ -1037,6 +1196,7 @@ ALTER TABLE cnpjs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE cnpjs FORCE ROW LEVEL SECURITY;
 
 -- [SELECT]: Leitura pública
+DROP POLICY IF EXISTS cnpjs_public_read ON cnpjs;
 CREATE POLICY cnpjs_public_read ON cnpjs
     FOR SELECT
     USING (true);
@@ -1050,6 +1210,7 @@ ALTER TABLE currencies ENABLE ROW LEVEL SECURITY;
 ALTER TABLE currencies FORCE ROW LEVEL SECURITY;
 
 -- [SELECT]: Leitura pública
+DROP POLICY IF EXISTS currencies_public_read ON currencies;
 CREATE POLICY currencies_public_read ON currencies
     FOR SELECT
     USING (true);
@@ -1059,37 +1220,48 @@ CREATE POLICY currencies_public_read ON currencies
 -- ============================================================================
 
 -- Query para verificar se todas as tabelas com tenant_id têm RLS habilitado
-DO $
+DO $$
 DECLARE
     tbl_record RECORD;
     missing_rls TEXT[] := ARRAY[]::TEXT[];
+    missing_force TEXT[] := ARRAY[]::TEXT[];
 BEGIN
     FOR tbl_record IN 
-        SELECT DISTINCT t.tablename
+        SELECT 
+            t.tablename,
+            pc.relrowsecurity AS has_rls,
+            pc.relforcerowsecurity AS has_force
         FROM pg_tables t
         JOIN information_schema.columns c 
             ON c.table_name = t.tablename 
             AND c.table_schema = t.schemaname
+        JOIN pg_class pc ON pc.relname = t.tablename
+        JOIN pg_namespace pn ON pc.relnamespace = pn.oid AND pn.nspname = t.schemaname
         WHERE t.schemaname = 'public'
         AND c.column_name = 'tenant_id'
-        AND NOT EXISTS (
-            SELECT 1 FROM pg_class pc
-            JOIN pg_namespace pn ON pc.relnamespace = pn.oid
-            WHERE pc.relname = t.tablename
-            AND pn.nspname = t.schemaname
-            AND pc.relrowsecurity = true
-        )
     LOOP
-        missing_rls := array_append(missing_rls, tbl_record.tablename);
+        -- Checa se RLS está habilitado (ENABLE)
+        IF NOT tbl_record.has_rls THEN
+            missing_rls := array_append(missing_rls, tbl_record.tablename);
+        END IF;
+
+        -- Checa se o FORCE RLS está ativo (Obrigatório para SaaS seguro)
+        IF NOT tbl_record.has_force THEN
+            missing_force := array_append(missing_force, tbl_record.tablename);
+        END IF;
     END LOOP;
     
+    -- Reporta RLS faltando
     IF array_length(missing_rls, 1) > 0 THEN
-        RAISE WARNING 'Tabelas com tenant_id sem RLS habilitado: %', array_to_string(missing_rls, ', ');
-    ELSE
-        RAISE NOTICE '✓ Todas as tabelas com tenant_id possuem RLS habilitado';
+        RAISE WARNING 'PERIGO: Tabelas sem RLS habilitado: %', array_to_string(missing_rls, ', ');
     END IF;
-END $;
 
--- ============================================================================
--- FIM DAS POLÍTICAS RLS
--- ============================================================================
+    -- Reporta FORCE faltando
+    IF array_length(missing_force, 1) > 0 THEN
+        RAISE WARNING 'ATENÇÃO: Tabelas sem FORCE RLS (Dono ignora segurança): %', array_to_string(missing_force, ', ');
+    END IF;
+
+    IF array_length(missing_rls, 1) IS NULL AND array_length(missing_force, 1) IS NULL THEN
+        RAISE NOTICE '✓ Segurança Total: Todas as tabelas de tenant estão protegidas com ENABLE e FORCE RLS.';
+    END IF;
+END $$;

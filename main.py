@@ -20,6 +20,7 @@ from src.db.db import db
 from src import middleware
 from src import util
 from src.globals import globals_get_redis_client
+import uvicorn
 import contextlib
 import asyncio
 import time
@@ -79,6 +80,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    max_age=3600
 )
 
 
@@ -220,4 +222,18 @@ async def global_exception_handler(request: Request, exc: Exception):
         error_level="FATAL",
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail="Internal server error"
+    )
+    
+    
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        workers=4,
+        loop="uvloop",
+        http="httptools",
+        # log_level="warning",
+        limit_concurrency=1000,
+        timeout_keep_alive=5
     )

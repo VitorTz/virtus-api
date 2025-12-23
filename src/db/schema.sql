@@ -7,9 +7,12 @@
 -- EXTENSIONS
 -- ============================================================================
 
+CREATE SCHEMA IF NOT EXISTS partman;
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 CREATE EXTENSION IF NOT EXISTS "citext";
+CREATE EXTENSION IF NOT EXISTS "pg_partman" WITH SCHEMA partman;
+CREATE EXTENSION IF NOT EXISTS "pg_cron";
 
 -- ============================================================================
 -- API USER
@@ -241,7 +244,7 @@ BEGIN
         WHEN 'GERENTE'    THEN 99
         WHEN 'FINANCEIRO' THEN 92
         WHEN 'CONTADOR'   THEN 80        
-        WHEN 'FISCAL' THEN 70
+        WHEN 'FISCAL_CAIXA' THEN 70
         WHEN 'COMPRADOR'    THEN 60            
         WHEN 'CAIXA'    THEN 50
         WHEN 'VENDEDOR' THEN 50
@@ -314,10 +317,26 @@ DO UPDATE SET
     sefaz_code = EXCLUDED.sefaz_code,
     descr = EXCLUDED.descr;
 
--- NCM 
-CREATE TABLE IF NOT EXISTS fiscal_ncms (
-    code VARCHAR(8) NOT NULL PRIMARY KEY,
-        
+-- ============================================================================
+-- NCM VERSION
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS ibpt_versions (
+    version TEXT PRIMARY KEY,  -- Ex: '24.1.B' (Versão da tabela IBPT)
+    valid_from DATE,
+    valid_until DATE,
+    source TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+-- ============================================================================
+-- NCM
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS fiscal_ncms (    
+    code TEXT NOT NULL,
+    uf VARCHAR(2) NOT NULL,
+    version TEXT NOT NULL,
+
     description TEXT NOT NULL, -- Descrição oficial (Ex: "Cervejas de malte")
     
     -- Alíquotas aproximadas (Lei 12.741/2012 - De Olho no Imposto)
@@ -325,19 +344,15 @@ CREATE TABLE IF NOT EXISTS fiscal_ncms (
     federal_import_rate NUMERIC(5, 2) DEFAULT 0,   -- Imposto Federal (Produtos Importados)
     state_rate NUMERIC(5, 2) DEFAULT 0,            -- Imposto Estadual (ICMS aproximado)
     municipal_rate NUMERIC(5, 2) DEFAULT 0,        -- Imposto Municipal (Serviços)
-    
-    -- Controle de Vigência (Tabelas do IBPT expiram)
-    valid_from DATE,
-    valid_until DATE,
-    
-    -- Metadados de Importação
-    version VARCHAR(20), -- Ex: '24.1.B' (Versão da tabela IBPT)
-    
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        
+    PRIMARY KEY (code, uf),
+    FOREIGN KEY (version) REFERENCES ibpt_versions(version) ON DELETE CASCADE ON UPDATE CASCADE,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_fiscal_ncms_description_trgm ON fiscal_ncms USING GIN (description gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_fiscal_ncms_description_trgm ON fiscal_ncms USING GIN (description gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_fiscal_ncms_version ON fiscal_ncms(version);
+CREATE INDEX IF NOT EXISTS idx_fiscal_ncms_uf ON fiscal_ncms(uf);
 
 -- ============================================================================
 -- CNPJS
@@ -656,7 +671,6 @@ CREATE TABLE IF NOT EXISTS products (
     CONSTRAINT products_promo_price_chk CHECK (promo_price IS NULL OR promo_price < sale_price)
 );
 
-CREATE INDEX IF NOT EXISTS idx_products_search_name ON products USING gin(name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_products_search_sku ON products USING btree(sku) WHERE sku IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_products_pos_list ON products(tenant_id, category_id, name) WHERE is_active = TRUE;
 CREATE INDEX IF NOT EXISTS idx_products_gtin ON products(tenant_id, gtin) WHERE gtin IS NOT NULL;
@@ -756,7 +770,7 @@ BEGIN
       AND p.is_active = true
       AND (
         -- Busca full-text
-        p.search_vector @@ plainto_tsquery('portuguese', search_query)
+        p.search_vector @@ websearch_to_tsquery('portuguese', search_query)
         -- Fallback para buscas por SKU exato
         OR (p.sku IS NOT NULL AND p.sku ILIKE '%' || search_query || '%')
         -- Fallback para busca por nome (para queries muito curtas)
@@ -917,7 +931,7 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 CREATE INDEX IF NOT EXISTS idx_refresh_token_family ON refresh_tokens(family_id);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_active_family ON refresh_tokens(family_id) WHERE revoked = FALSE;
 CREATE INDEX IF NOT EXISTS idx_refresh_token_hash ON refresh_tokens(token_hash);
-CREATE INDEX IF NOT EXISTS idx_refresh_tokens_cleanup ON refresh_tokens (created_at) WHERE revoked = false AND expires_at < NOW() - INTERVAL '30 days';
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires_at ON refresh_tokens (expires_at);
 
 -- ============================================================================
 -- PRICE AUDITS - Histórico de alterações de preços
@@ -988,7 +1002,7 @@ ALTER TABLE stock_movements SET (
 
 
 CREATE OR REPLACE FUNCTION fn_update_stock_balance()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER SECURITY DEFINER AS $$
 DECLARE
     movement_multiplier INTEGER;
 BEGIN
@@ -1028,10 +1042,8 @@ BEGIN
 
     -- 2. Atualiza o Estoque Geral do Produto
     UPDATE products
-    SET 
-        stock_quantity = stock_quantity + (NEW.quantity * movement_multiplier),
-        updated_at = NOW() -- Atualiza timestamp para sincronia
-    WHERE id = NEW.product_id;
+SET stock_quantity = stock_quantity + (NEW.quantity * movement_multiplier)
+WHERE id = NEW.product_id;
 
     -- 3. Se houver Lote vinculado, atualiza o saldo do Lote
     IF NEW.batch_id IS NOT NULL THEN
@@ -1052,17 +1064,62 @@ FOR EACH ROW
 EXECUTE FUNCTION fn_update_stock_balance();
 
 -- ============================================================================
+-- FISCAL_SEQUENCES
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS fiscal_sequences (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id UUID NOT NULL,
+    
+    -- Chave composta (Quem é a sequência?)
+    series INTEGER NOT NULL DEFAULT 1,
+    model VARCHAR(2) NOT NULL DEFAULT '65', -- 65=NFCe, 59=SAT, 55=NFe
+    
+    -- O contador
+    current_number INTEGER NOT NULL DEFAULT 0,
+    
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    
+    -- Garante que só existe UM contador por Série/Modelo na Loja
+    CONSTRAINT fiscal_sequences_unique_key UNIQUE (tenant_id, model, series),
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+);
+
+CREATE OR REPLACE FUNCTION get_next_fiscal_number(
+    p_tenant_id UUID,
+    p_series INTEGER,
+    p_model VARCHAR
+) 
+RETURNS INTEGER AS $$
+DECLARE
+    v_new_number INTEGER;
+BEGIN
+    -- Tenta atualizar e retornar o novo valor (Lock atômico)
+    INSERT INTO fiscal_sequences (tenant_id, series, model, current_number, updated_at)
+    VALUES (p_tenant_id, p_series, p_model, 1, NOW())
+    ON CONFLICT (tenant_id, series, model)
+    DO UPDATE SET 
+        current_number = fiscal_sequences.current_number + 1,
+        updated_at = NOW()
+    RETURNING current_number INTO v_new_number;
+
+    RETURN v_new_number;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- ============================================================================
 -- SALES
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS sales (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID DEFAULT uuid_generate_v4(),
     
     -- Totais
     subtotal NUMERIC(10, 2) NOT NULL DEFAULT 0,
     total_discount NUMERIC(10, 2) DEFAULT 0,
     shipping_fee NUMERIC(10, 2) DEFAULT 0, -- Taxa de entrega (Delivery)
-    total_amount NUMERIC(10, 2) NOT NULL DEFAULT 0, -- (Subtotal - Desc + Frete)
+    service_fee NUMERIC(10, 2) DEFAULT 0, -- Gorjeta
+    total_amount NUMERIC(10, 2) NOT NULL DEFAULT 0, -- (Subtotal - Desc + Frete + Service Fee)
     
     status sale_status_enum DEFAULT 'ABERTA',
 
@@ -1089,27 +1146,30 @@ CREATE TABLE IF NOT EXISTS sales (
     -- Auditoria e Isolamento
     tenant_id UUID NOT NULL,
     created_by UUID, -- Quem abriu a venda (geralmente o Caixa)
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP,
     finished_at TIMESTAMP,
 
-    CONSTRAINT sales_fiscal_key_unique UNIQUE (tenant_id, fiscal_key) WHERE fiscal_key IS NOT NULL,
+    PRIMARY KEY (id, created_at),
 
+    CONSTRAINT sales_fiscal_key_unique UNIQUE (tenant_id, fiscal_key, created_at),
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
     FOREIGN KEY (salesperson_id) REFERENCES users(id) ON DELETE SET NULL,
     FOREIGN KEY (waiter_id) REFERENCES users(id) ON DELETE SET NULL,
     FOREIGN KEY (customer_id) REFERENCES users(id) ON DELETE SET NULL,
     FOREIGN KEY (cancelled_by) REFERENCES users(id) ON DELETE SET NULL,
     FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
-);
+) PARTITION BY RANGE (created_at);
+
 
 CREATE INDEX IF NOT EXISTS idx_sales_tenant_status_created ON sales(tenant_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sales_fiscal ON sales(tenant_id, fiscal_number, fiscal_series);
 CREATE INDEX IF NOT EXISTS idx_sales_command ON sales(tenant_id, command_number) WHERE status = 'ABERTA';
 CREATE INDEX IF NOT EXISTS idx_sales_dashboard ON sales(tenant_id, status, created_at DESC) INCLUDE (total_amount, salesperson_id);
+CREATE INDEX IF NOT EXISTS idx_sales_salesperson_id ON sales(salesperson_id);
+CREATE INDEX IF NOT EXISTS idx_sales_customer_id ON sales(customer_id);
+CREATE INDEX IF NOT EXISTS idx_sales_waiter ON sales(tenant_id, waiter_id);
+CREATE INDEX IF NOT EXISTS idx_sales_date_range ON sales(tenant_id, created_at);
 
-ALTER TABLE sales SET (
-    autovacuum_vacuum_scale_factor = 0.05
-);
 
 -- [PARA GERENCIAR CANCELAMENTO DE VENDA]
 CREATE OR REPLACE FUNCTION fn_handle_sale_cancellation()
@@ -1140,7 +1200,9 @@ BEGIN
             'Cancelamento da Venda #' || NEW.fiscal_number,
             NEW.cancelled_by
         FROM sale_items si
-        WHERE si.sale_id = NEW.id;
+        WHERE 
+            si.sale_id = NEW.id 
+            AND si.sale_created_at = NEW.created_at;
         
         -- 2. Estorno Financeiro (Fiado)
         -- Se a venda foi no fiado, precisamos estornar o saldo do cliente.
@@ -1165,15 +1227,85 @@ AFTER UPDATE OF status ON sales
 FOR EACH ROW EXECUTE FUNCTION fn_handle_sale_cancellation();
 
 
+CREATE OR REPLACE FUNCTION fn_validate_sale_totals()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_items_sum NUMERIC(15,2);
+    v_calc_total NUMERIC(15,2);
+BEGIN
+    IF NEW.status != 'CONCLUIDA' THEN
+        RETURN NEW;
+    END IF;
+
+    -- CORREÇÃO DA LYSANDRA: Adicionado sale_created_at para Partition Pruning
+    SELECT COALESCE(SUM(subtotal), 0)
+    INTO v_items_sum
+    FROM sale_items
+    WHERE sale_id = NEW.id 
+      AND sale_created_at = NEW.created_at; -- <--- O SEGREDO ESTÁ AQUI
+
+    v_calc_total := v_items_sum + COALESCE(NEW.shipping_fee, 0) + COALESCE(NEW.service_fee, 0) - COALESCE(NEW.total_discount, 0);
+
+    IF ABS(v_calc_total - NEW.total_amount) > 0.01 THEN
+        RAISE EXCEPTION 'FRAUDE/ERRO DETECTADO: Divergência de valores na Venda %. Itens+Taxas calc: %, Header diz: %', 
+            NEW.fiscal_number, v_calc_total, NEW.total_amount;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER trg_sales_validate_integrity
+BEFORE UPDATE OF status ON sales
+FOR EACH ROW
+EXECUTE FUNCTION fn_validate_sale_totals();
+
+
+CREATE OR REPLACE FUNCTION fn_assign_fiscal_number()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Só age se a venda está sendo CONCLUÍDA e ainda não tem número
+    IF NEW.status = 'CONCLUIDA' AND (OLD.status IS DISTINCT FROM 'CONCLUIDA') THEN
+        
+        -- Se já vier com número (ex: importação), não faz nada
+        IF NEW.fiscal_number IS NOT NULL THEN
+            RETURN NEW;
+        END IF;
+
+        -- Garante valores padrão para Série e Modelo se estiverem nulos
+        NEW.fiscal_series := COALESCE(NEW.fiscal_series, 1);
+        NEW.fiscal_model := COALESCE(NEW.fiscal_model, '65'); -- Padrão NFCe
+
+        -- Chama a função que trava e incrementa
+        NEW.fiscal_number := get_next_fiscal_number(
+            NEW.tenant_id,
+            NEW.fiscal_series,
+            NEW.fiscal_model
+        );
+                
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- O Trigger deve ser BEFORE UPDATE
+CREATE OR REPLACE TRIGGER trg_sales_assign_fiscal_number
+BEFORE UPDATE ON sales
+FOR EACH ROW
+EXECUTE FUNCTION fn_assign_fiscal_number();
+
+
 -- ============================================================================
 -- ITENS DE VENDA - Produtos vendidos em cada venda
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS sale_items (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID DEFAULT uuid_generate_v4(),
     tenant_id UUID NOT NULL, -- Desnormalização para RLS rápido
     
     sale_id UUID NOT NULL,
+    sale_created_at TIMESTAMP NOT NULL,
     product_id UUID NOT NULL,
     batch_id UUID, -- De qual lote saiu esse produto? (Importante p/ validade)
     
@@ -1190,12 +1322,12 @@ CREATE TABLE IF NOT EXISTS sale_items (
     ncm VARCHAR(8),
     tax_snapshot JSONB, -- Guarda ICMS, PIS, COFINS calculados no momento
     notes TEXT, -- "Sem cebola", "Bem passado"
-
+    PRIMARY KEY (id, sale_created_at),
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
     FOREIGN KEY (product_id) REFERENCES products(id),
     FOREIGN KEY (batch_id) REFERENCES batches(id),
-    FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE
-);
+    FOREIGN KEY (sale_id, sale_created_at) REFERENCES sales(id, created_at) ON DELETE CASCADE
+) PARTITION BY RANGE (sale_created_at);
 
 CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
 CREATE INDEX IF NOT EXISTS idx_sales_customer_lookup ON sales(id, customer_id, status);
@@ -1206,27 +1338,31 @@ CREATE INDEX IF NOT EXISTS idx_sales_tenant_created_finished ON sales(tenant_id,
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS sale_payments (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID DEFAULT uuid_generate_v4(),
+    tenant_id UUID NOT NULL,
+    
     sale_id UUID NOT NULL,
-    tenant_id UUID NOT NULL, -- RLS
+    sale_created_at TIMESTAMP NOT NULL,
     
     method payment_method_enum NOT NULL,
-    amount NUMERIC(10, 2) NOT NULL, -- Valor efetivo pago (sem troco)
+    amount NUMERIC(10, 2) NOT NULL,
     
-    -- Detalhes para Conciliação de Caixa
-    amount_tendered NUMERIC(10, 2), -- Valor entregue (ex: deu nota de 50 pra pagar 45)
-    change_amount NUMERIC(10, 2) DEFAULT 0, -- Troco (ex: 5)
-    
-    installments INTEGER DEFAULT 1, -- Parcelas
-    card_brand VARCHAR(50), -- Visa, Master
-    auth_code VARCHAR(100), -- NSU / Autorização
+    amount_tendered NUMERIC(10, 2),
+    change_amount NUMERIC(10, 2) DEFAULT 0,
+    installments INTEGER DEFAULT 1,
+    card_brand VARCHAR(50),
+    auth_code VARCHAR(100),
 
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     created_by UUID,
 
-    FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE,
+    -- PK Composta Local
+    PRIMARY KEY (id, sale_created_at),
+
+    -- FK Composta para a Venda
+    FOREIGN KEY (sale_id, sale_created_at) REFERENCES sales(id, created_at) ON DELETE CASCADE,
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
-);
+) PARTITION BY RANGE (sale_created_at);
 
 CREATE INDEX IF NOT EXISTS idx_sale_payments_sale ON sale_payments(sale_id);
 CREATE INDEX IF NOT EXISTS idx_sale_payments_created ON sale_payments(tenant_id, created_at DESC);
@@ -1241,17 +1377,27 @@ DECLARE
     v_total_paid NUMERIC;
 BEGIN
     -- Busca o total da venda
-    SELECT total_amount INTO v_sale_total FROM sales WHERE id = NEW.sale_id;
+    SELECT 
+        total_amount 
+    INTO 
+        v_sale_total 
+    FROM 
+        sales 
+    WHERE 
+        id = NEW.sale_id
+        AND created_at = NEW.sale_created_at;
     
     -- Calcula quanto já foi pago (somando o novo pagamento)
-    SELECT COALESCE(SUM(amount), 0) + NEW.amount 
-    INTO v_total_paid 
-    FROM sale_payments 
-    WHERE sale_id = NEW.sale_id AND id != NEW.id; -- Exclui o próprio se for update (embora update seja raro)
-
-    -- Permite pequena margem de erro por arredondamento ou gorjeta, 
-    -- mas idealmente o backend controla isso. 
-    -- Aqui é apenas um 'sanity check' básico.
+    SELECT 
+        COALESCE(SUM(amount), 0) + NEW.amount 
+    INTO 
+        v_total_paid 
+    FROM 
+        sale_payments 
+    WHERE 
+        sale_id = NEW.sale_id 
+        AND id != NEW.id
+        AND sale_created_at = NEW.sale_created_at;    
     
     RETURN NEW;
 END;
@@ -1362,11 +1508,6 @@ FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 -- addresses
 CREATE OR REPLACE TRIGGER trg_addresses_updated_at
 BEFORE UPDATE ON addresses
-FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
--- fiscal_ncms
-CREATE OR REPLACE TRIGGER trg_fiscal_ncms_updated_at
-BEFORE UPDATE ON fiscal_ncms
 FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- categories

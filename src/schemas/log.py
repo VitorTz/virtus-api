@@ -58,6 +58,7 @@ class Log(BaseModel):
                 return {}
         return v
 
+
 class DeletedLogs(BaseModel):
 
     total: int

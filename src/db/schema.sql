@@ -499,22 +499,12 @@ DECLARE
     v_my_role_level INTEGER;
     v_my_id UUID;
     v_my_tenant UUID;
-    v_is_system_action BOOLEAN;
 BEGIN
 
     -- Bypass
-    IF SESSION_USER != 'postgres' THEN
-        v_is_system_action := FALSE;
-    ELSE
-        v_is_system_action := COALESCE(
-            NULLIF(current_setting('app.is_system_action', TRUE), ''), 
-            'false'
-        )::BOOLEAN;
-    END IF;
-
-    IF v_is_system_action IS TRUE THEN
+    IF SESSION_USER = 'postgres' THEN
         RETURN NEW;
-    END IF;
+    END IF;  
 
     -- Carrega contexto atual (usando suas funções auxiliares)
     v_my_id := current_user_id();
@@ -608,13 +598,13 @@ BEGIN
         END IF;
 
         IF v_my_role_level < 92 THEN
-             RAISE EXCEPTION 'PERMISSÃO NEGADA: Apenas Admins (92+) podem deletar usuários.'
-             USING ERRCODE = 'P0002';
+            RAISE EXCEPTION 'PERMISSÃO NEGADA: Apenas Admins (92+) podem deletar usuários.'
+            USING ERRCODE = 'P0002';
         END IF;
 
         IF v_my_role_level < OLD.max_privilege_level THEN
-             RAISE EXCEPTION 'HIERARQUIA: Você não pode deletar um superior.'
-             USING ERRCODE = 'P0002';
+            RAISE EXCEPTION 'HIERARQUIA: Você não pode deletar um superior.'
+            USING ERRCODE = 'P0002';
         END IF;
     END IF;
 
@@ -628,11 +618,10 @@ FOR EACH ROW EXECUTE FUNCTION guard_users_modification();
 
 
 CREATE OR REPLACE FUNCTION update_last_login_safe(p_user_id UUID)
-RETURNS VOID SET search_path = public, extensions, pg_temp AS $$
+RETURNS VOID
+SET search_path = public, extensions, pg_temp
+AS $$
 BEGIN
-
-    PERFORM set_config('app.is_system_action', 'true', true);
-    
     UPDATE 
         users 
     SET 
@@ -641,7 +630,6 @@ BEGIN
         id = p_user_id;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
-
 
 CREATE OR REPLACE FUNCTION get_user_login_data(p_identifier TEXT)
 RETURNS TABLE (
@@ -656,8 +644,10 @@ RETURNS TABLE (
     created_by UUID,
     updated_at TIMESTAMPTZ,
     tenant_id UUID,
-    roles TEXT[]
-) SET search_path = public, extensions, pg_temp AS $$
+    roles TEXT[],
+    max_privilege_level INTEGER
+) 
+SET search_path = public, extensions, pg_temp AS $$
 DECLARE
     v_clean_input TEXT;
     v_is_email BOOLEAN;
@@ -678,7 +668,8 @@ BEGIN
         u.created_by,
         u.updated_at::TIMESTAMPTZ,
         u.tenant_id,
-        u.roles::TEXT[]
+        u.roles::TEXT[],
+        u.max_privilege_level
     FROM 
         users u
     WHERE
@@ -1768,7 +1759,6 @@ CREATE TABLE IF NOT EXISTS logs (
 
 CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
 CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_logs_metadata ON logs USING gin(metadata);
 
 ALTER TABLE logs SET (
     autovacuum_vacuum_scale_factor = 0.1,

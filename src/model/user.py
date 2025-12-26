@@ -12,7 +12,17 @@ async def get_login_data(login: LoginRequest, conn: Connection) -> Optional[Logi
 
 
 async def update_user_last_login(user_id: str | UUID, conn: Connection) -> None:
-    await conn.execute("SELECT update_last_login_safe($1::uuid)", user_id)
+    await conn.execute(
+        """
+            UPDATE 
+                users 
+            SET 
+                last_login_at = CURRENT_TIMESTAMP
+            WHERE 
+                id = $1
+        """,
+        user_id
+    )
 
 
 async def get_user_by_id(id: str | UUID, conn: Connection) -> UserResponse:
@@ -29,7 +39,8 @@ async def get_user_by_id(id: str | UUID, conn: Connection) -> UserResponse:
             updated_at,
             created_by,
             tenant_id,
-            roles
+            roles,
+            max_privilege_level
         FROM
             users
         WHERE
@@ -89,7 +100,8 @@ async def create_user(
                 created_at,
                 updated_at,
                 created_by,
-                roles
+                roles,
+                max_privilege_level
         """,
         new_user.name,
         new_user.nickname,
@@ -120,7 +132,8 @@ async def get_staff_members(conn: Connection, limit: int = 64, offset: int = 0) 
                 created_at,
                 updated_at,
                 created_by,
-                roles
+                roles,
+                max_privilege_level
             FROM
                 users
             WHERE

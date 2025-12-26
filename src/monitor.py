@@ -64,7 +64,6 @@ class RollingMetrics:
 
 
 class SystemMonitor:
-    """Monitor avançado de recursos do sistema para FastAPI"""
     
     def __init__(self, history_size: int = 288, enable_gc_on_read: bool = False):
         """
@@ -323,12 +322,6 @@ class SystemMonitor:
         }
     
     def increment_request(self, response_time_ms: Optional[float] = None):
-        """
-        Incrementa contador de requests e registra tempo de resposta
-        
-        Args:
-            response_time_ms: Tempo de resposta em milissegundos
-        """
         with self._lock:
             self._request_count += 1
         

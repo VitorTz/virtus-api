@@ -98,6 +98,11 @@ $$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
 CREATE OR REPLACE FUNCTION fn_set_tenant_and_creator()
 RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
 BEGIN
+
+    IF SESSION_USER = 'postgres' THEN
+        RETURN NEW;
+    END IF;
+
     IF TG_OP = 'INSERT' THEN
         NEW.tenant_id := current_user_tenant_id();
         NEW.created_by := current_user_id();
@@ -115,7 +120,8 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;
 -- Impede a mudança de tenant_id
 CREATE OR REPLACE FUNCTION fn_set_tenant()
 RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
-BEGIN    
+BEGIN
+    
     IF SESSION_USER = 'postgres' THEN
         RETURN NEW;
     END IF;
@@ -135,8 +141,23 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;
 -- Para auditar mudanças na tabela de usuários
 CREATE OR REPLACE FUNCTION fn_users_audit_changes()
 RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
+DECLARE
+    v_new_adjusted users;
 BEGIN
     IF TG_OP = 'UPDATE' THEN
+        IF NEW IS NOT DISTINCT FROM OLD THEN
+            RETURN NULL;
+        END IF;
+        
+        IF NEW.last_login_at IS DISTINCT FROM OLD.last_login_at THEN
+            v_new_adjusted := NEW;
+            v_new_adjusted.last_login_at := OLD.last_login_at;
+            v_new_adjusted.updated_at := OLD.updated_at;            
+            IF v_new_adjusted IS NOT DISTINCT FROM OLD THEN
+                RETURN NULL; -- Sai da função sem gravar nada!
+            END IF;
+        END IF;
+        
         INSERT INTO security_audit_log (
             user_id,
             tenant_id,
@@ -154,6 +175,7 @@ BEGIN
             row_to_json(OLD)::jsonb - 'password_hash' - 'quick_access_pin_hash',
             row_to_json(NEW)::jsonb - 'password_hash' - 'quick_access_pin_hash'
         );
+
     ELSIF TG_OP = 'DELETE' THEN
         INSERT INTO security_audit_log (
             user_id,
@@ -168,14 +190,14 @@ BEGIN
             'DELETE',
             'users',
             OLD.id,
-            row_to_json(NEW)::jsonb - 'password_hash' - 'quick_access_pin_hash'
+            row_to_json(OLD)::jsonb - 'password_hash' - 'quick_access_pin_hash'
         );
     END IF;
+    
+    RETURN NULL; 
 
     EXCEPTION WHEN OTHERS THEN
         RAISE EXCEPTION 'AUDITORIA FALHOU: % - Operação bloqueada para segurança', SQLERRM;      
-    
-    RETURN COALESCE(NEW, OLD);
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
@@ -1146,7 +1168,6 @@ CREATE POLICY security_audit_log_insert_policy ON security_audit_log
     WITH CHECK (tenant_id = current_user_tenant_id());
 
 -- [DELETE/UPDATE] Ninguém pode deletar ou atualizar 
-
 DROP POLICY IF EXISTS security_audit_log_immutable ON security_audit_log;
 CREATE POLICY security_audit_log_immutable ON security_audit_log
     FOR UPDATE USING (false);

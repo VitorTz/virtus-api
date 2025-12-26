@@ -44,8 +44,7 @@ class UserBase(BaseModel):
     roles: List[str] = Field(
         default=[],
         description="Papeis que o usuário acumula no sistema"
-    )
-    
+    )    
     
     state_tax_indicator: int = Field(
         default=9, 
@@ -153,6 +152,7 @@ class UserResponse(UserBase):
     tenant_id: UUID
     created_at: datetime
     updated_at: datetime
+    max_privilege_level: int
     created_by: Optional[UUID]
     model_config = ConfigDict(from_attributes=True)
     

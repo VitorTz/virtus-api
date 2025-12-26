@@ -31,7 +31,6 @@ async def login(
     response: Response, 
     conn: Connection
 ) -> UserResponse:
-    
     if refresh_token:
         try:
             await refresh_token_model.revoke_token_family_by_token_id(
@@ -58,7 +57,20 @@ async def login(
     access_token_create: AccessTokenCreate = security.create_access_token(data.id)
     
     refresh_token_create: RefreshTokenCreate = security.create_refresh_token(data.id)
-    
+    await conn.execute("SET LOCAL ROLE app_runtime")
+    await conn.execute(
+        """
+        SELECT set_config('app.current_user_id', $1::text, true),
+                set_config('app.current_user_roles', $2, true),
+                set_config('app.current_user_tenant_id', $3::text, true),
+                set_config('app.current_user_max_privilege', $4::text, true)
+        """,
+        str(data.id),
+        "{" + ",".join(data.roles) + "}",
+        str(data.tenant_id),
+        str(data.max_privilege_level)
+    )
+                
     await db_safe_exec(
         user_model.update_user_last_login(data.id, conn),
         refresh_token_model.create_refresh_token(refresh_token_create, conn)
@@ -83,7 +95,8 @@ async def login(
         created_at=data.created_at,
         updated_at=data.updated_at,
         tenant_id=data.tenant_id,
-        created_by=data.created_by
+        created_by=data.created_by,
+        max_privilege_level=data.max_privilege_level
     )
     
     

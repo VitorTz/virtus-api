@@ -23,7 +23,8 @@ async def update_user_roles(user_id: str, roles: list[str], conn: Connection) ->
                 updated_at,
                 created_by,
                 tenant_id,
-                roles
+                roles,
+                max_privilege_level
         """,
         roles,
         user_id

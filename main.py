@@ -14,6 +14,7 @@ from src.routes import auth
 from src.routes import feedback
 from src.routes import currency
 from src.routes import companies
+from src.routes import audit
 from src.routes import staff
 from src.routes import address
 from src.routes import ncm
@@ -113,6 +114,7 @@ app.include_router(feedback.router, prefix='/api/v1/feedback', tags=['feedback']
 app.include_router(currency.router, prefix='/api/v1/currency', tags=['currency'])
 app.include_router(address.router, prefix='/api/v1/cep', tags=['cep'])
 app.include_router(companies.router, prefix='/api/v1/companies', tags=['companies'])
+app.include_router(audit.router, prefix='/api/v1/audit', tags=['audit'])
 app.include_router(ncm.router, prefix='/api/v1/ncm', tags=['ncm'])
 app.include_router(monitor.router, prefix='/api/v1/admin/monitor', tags=['monitor'])
 app.include_router(logs.router, prefix='/api/v1/admin/logs', tags=['logs'])

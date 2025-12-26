@@ -305,8 +305,6 @@ async def remove_logs(
     """
     Deleta logs com base em filtros
     
-    **ATENÇÃO:** Esta operação é irreversível!
-    
     - **interval_minutes**: Deleta logs mais antigos que N minutos
     - **method**: Deleta logs de método HTTP específico
     - **level**: Deleta logs de nível específico
@@ -374,7 +372,7 @@ async def remove_logs(
     description="Remove logs antigos automaticamente"
 )
 async def cleanup_old_logs(
-    days: int = Query(30, ge=1, le=365, description="Manter logs dos últimos N dias"),
+    days: int = Query(default=15, ge=1, le=365, description="Manter logs dos últimos N dias"),
     confirm: bool = Query(False, description="Confirmação obrigatória"),
     conn = Depends(get_postgres_connection)    
 ):

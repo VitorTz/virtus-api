@@ -177,7 +177,7 @@ async def get_rls_connection(
             try:
                 row = await user_model.get_user_rls_data(user_data.user_id, connection)
                 if not row: raise CREDENTIALS_EXCEPTION
-                await connection.execute("SET LOCAL ROLE app_runtime")                            
+                await connection.execute("SET LOCAL ROLE app_runtime")
                 await connection.execute(
                     """
                     SELECT set_config('app.current_user_id', $1::text, true),

@@ -58,7 +58,7 @@ def create_superuser():
         
         with psycopg.connect(db_url) as conn:
             with conn.cursor() as cur:
-                print("Inserindo no banco...")
+                cur.execute("SET app.is_system_action = 'true';")
                 cur.execute(
                     """
                     INSERT INTO users (

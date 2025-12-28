@@ -1,4 +1,5 @@
-from src.schemas.user import LoginData, UserResponse, UserCreate
+from src.constants import Constants
+from src.schemas.user import LoginData, UserResponse, UserCreate, UserManagementContext
 from src.schemas.auth import LoginRequest
 from asyncpg import Connection, Record
 from src.schemas.general import Pagination
@@ -29,6 +30,47 @@ async def update_user_last_login(user_id: str | UUID, conn: Connection) -> None:
         print(e)
         raise e
     print("oi1")
+
+
+async def get_user_roles(id: str | UUID, conn: Connection) -> list[str]:
+    row = await conn.fetchrow("SELECT roles FROM users WHERE id = $1", id)
+    return row['roles'] if row else []
+
+
+async def get_user_management_context(
+    user_id: str | UUID,            # Ator (Quem executa a ação)
+    desired_roles: list[str],       # Roles alvo
+    conn: Connection,
+    new_user_id: Optional[str | UUID] = None # Alvo (Quem sofre a ação) - None se for criação
+) -> Optional[UserManagementContext]:
+    """
+        Está função deve ser usada quando um usuário é criado ou atualizado.
+        Ajuda a definir o que o usuário que está executando a ação pode ou não fazer.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT
+            u.max_privilege_level,
+            (u.roles && $2::user_role_enum[]) as has_management_permission,
+            get_max_privilege_from_roles($3::user_role_enum[]) as new_roles_max_privilege,
+            (
+                SELECT tenant_id 
+                FROM users target 
+                WHERE target.id = $4
+            ) as other_user_tenant_id
+            
+        FROM
+            users u
+        WHERE 
+            u.id = $1
+        """,
+        user_id,                    # $1
+        Constants.MANAGEMENT_ROLES, # $2
+        desired_roles,              # $3
+        new_user_id                 # $4 (Pode ser None)
+    )
+
+    return UserManagementContext(**row) if row else None
 
 
 async def get_user_by_id(id: str | UUID, conn: Connection) -> UserResponse:
@@ -76,7 +118,9 @@ async def get_user_rls_data(id: str | UUID, conn: Connection) -> Record:
 
 async def create_user(
     new_user: UserCreate,
-    new_user_password_hash: Optional[str],
+    password_hash: Optional[str],
+    quick_access_pin_hash: Optional[str],
+    tenant_id: str | UUID,
     conn: Connection
 ) -> UserResponse:
     
@@ -85,16 +129,18 @@ async def create_user(
             INSERT INTO users (
                 name,
                 nickname,
+                tenant_id,
                 email,
                 notes,
                 state_tax_indicator,
                 password_hash,
+                quick_access_pin_hash,
                 phone,
                 cpf,
                 roles
             )
             VALUES
-                ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING
                 id,
                 name,
@@ -106,19 +152,20 @@ async def create_user(
                 created_at,
                 updated_at,
                 created_by,
-                roles,
-                max_privilege_level
+                roles
         """,
         new_user.name,
         new_user.nickname,
+        tenant_id,
         new_user.email,
         new_user.notes,
         new_user.state_tax_indicator,
-        new_user_password_hash,
+        password_hash,
+        quick_access_pin_hash,
         new_user.phone,
         new_user.cpf,
         new_user.roles
-    )    
+    )
 
     return UserResponse(**dict(row)) if row else None
 

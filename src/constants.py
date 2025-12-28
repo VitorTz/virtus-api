@@ -36,4 +36,5 @@ class Constants:
         "interest-cohort=()"    # Bloqueia FLoC (privacidade)
     )
     
+    MANAGEMENT_ROLES = ["ADMIN", "GERENTE", "FISCAL_CAIXA"]    
     SENSITIVE_PATHS = ["/auth/", "/admin/"]

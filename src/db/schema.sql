@@ -710,6 +710,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+
 CREATE OR REPLACE TRIGGER set_max_privilege_on_user_change
 BEFORE INSERT OR UPDATE ON users
 FOR EACH ROW

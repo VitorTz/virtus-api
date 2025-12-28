@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from asyncpg import Connection
 from src import security
+from uuid import UUID
 
 
 INVALID_CREDENTIALS = HTTPException(
@@ -57,8 +58,7 @@ async def login(
     
     access_token_create: AccessTokenCreate = security.create_access_token(
         data.id,
-        data.tenant_id,
-        data.max_privilege_level
+        data.tenant_id
     )
     
     refresh_token_create: RefreshTokenCreate = security.create_refresh_token(data.id)    
@@ -133,8 +133,7 @@ async def refresh(
     
     access_token_create: AccessTokenCreate = security.create_access_token(
         user.id,
-        user.tenant_id,
-        user.max_privilege_level
+        user.tenant_id
     )
     
     refresh_token_create: RefreshTokenCreate = security.create_refresh_token(user.id, old_token.family_id)
@@ -155,10 +154,60 @@ async def refresh(
     return user
 
 
-async def signup(user: UserCreate, rls: RLSConnection) -> UserResponse:
+async def signup(user: UserCreate, tenant_id: str | UUID, rls: RLSConnection) -> UserResponse:
+    # 1. VALIDAÇÃO DE TENANT (Segurança Básica)
+    # Garante que o usuário logado só crie contas para sua própria empresa
+    if str(rls.user.tenant_id) != str(tenant_id):
+         raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="Você não pode criar usuários em outra organização."
+         )
+
+    # 2. CALCULAR PERMISSÕES    
+    actor_level, is_staff_authorized, new_target_level = await user_model.get_user_management_context(
+        user_id=rls.user.user_id, 
+        required_roles=["ADMIN", "GERENTE", "FISCAL_CAIXA"],
+        new_user_roles=user.roles,
+        conn=rls.conn
+    )
+    
+    # 3. LÓGICA DE BLOQUEIO
+    
+    # Regra A: Escalada de Privilégio Vertical
+    # Ninguém pode criar alguém mais poderoso que si mesmo.
+    if new_target_level > actor_level:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, 
+            detail=f"Seu nível ({actor_level}) é inferior ao nível do usuário que tenta criar ({new_target_level})."
+        )
+        
+    # Regra B: Permissão para criar Funcionários
+    # Se o novo usuário tem algum poder (nível > 0), quem cria precisa ser Staff Autorizado.
+    if new_target_level > 0 and not is_staff_authorized:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Você não tem permissão para criar funcionários com acesso administrativo."
+        )
+
+    # Regra C: Cliente criando Cliente (Opcional, mas recomendado travar)
+    # Se quem está criando não é Staff (ex: é um Cliente) e tenta criar outro Cliente.
+    if not is_staff_authorized and new_target_level == 0:
+        # Aqui depende da regra de negócio. Geralmente cliente não cria usuário.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Clientes não têm permissão para cadastrar novos usuários manualmente."
+        )
+
+    # 4. HASHING
+    password_hash = security.hash_password(user.password) if user.password else None
+    quick_access_pin_hash = security.hash_password(user.quick_access_pin_hash) if user.quick_access_pin_hash else None
+
+    # 5. CRIAÇÃO
     return await db_safe_exec(user_model.create_user(
         user, 
-        security.hash_password(user.password) if user.password else None, 
+        password_hash, 
+        quick_access_pin_hash, 
+        tenant_id, 
         rls.conn
     ))
 

@@ -8,7 +8,7 @@ from uuid import UUID
 
 
 async def get_login_data(login: LoginRequest, conn: Connection) -> Optional[LoginData]:
-    row = await conn.fetchrow("SELECT * FROM get_user_login_data($1)", login.identifier)
+    row = await conn.fetchrow("SELECT * FROM get_user_login_data($1, $2)", login.identifier, login.tenant_id)
     return LoginData(**row) if row else None
     
     

@@ -17,6 +17,7 @@ from src.routes import companies
 from src.routes import audit
 from src.routes import staff
 from src.routes import address
+from src.routes import admin
 from src.routes import ncm
 from src.routes import monitor
 from src.routes import logs
@@ -116,6 +117,7 @@ app.include_router(address.router, prefix='/api/v1/cep', tags=['cep'])
 app.include_router(companies.router, prefix='/api/v1/companies', tags=['companies'])
 app.include_router(audit.router, prefix='/api/v1/audit', tags=['audit'])
 app.include_router(ncm.router, prefix='/api/v1/ncm', tags=['ncm'])
+app.include_router(admin.router, prefix='/api/v1/admin', tags=['admin'])
 app.include_router(monitor.router, prefix='/api/v1/admin/monitor', tags=['monitor'])
 app.include_router(logs.router, prefix='/api/v1/admin/logs', tags=['logs'])
 

@@ -3,6 +3,9 @@ from fastapi import status
 from dotenv import load_dotenv
 from typing import TypeVar, Awaitable, Optional
 from src.exceptions import DatabaseError
+from psycopg.rows import dict_row
+from typing import Generator, Any
+import psycopg
 import asyncpg
 import os
 
@@ -77,7 +80,19 @@ async def get_db_pool() -> asyncpg.Pool:
 async def log_rls(conn: asyncpg.Connection) -> None:
     row = await conn.fetchrow("SELECT get_session_context_log()")
     print(row)
+    
 
+def get_db_cursor() -> Generator[psycopg.Cursor, Any, None]:
+    with psycopg.connect(os.getenv("DATABASE_URL_POSTGRES"), row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            try:
+                yield cur
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                print(f"Erro na transação: {e}")
+                raise e
+            
 
 T = TypeVar("T")
 

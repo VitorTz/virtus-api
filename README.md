@@ -15,7 +15,9 @@ O diferencial deste projeto reside na sua arquitetura de banco de dados avançad
 
 ### Principais Funcionalidades
 
-- **Multi-Tenancy Real**: Isolamento de dados forçado no banco de dados. A aplicação configura o contexto da sessão (app.current_user_tenant_id) e o PostgreSQL garante a blindagem.
+-**Servidores dedicados no Brasil**: Servidores hospedados pela square cloud, em São Paulo, com garantia de 99,9% de tempo a atividade.
+
+- **Multi-Tenancy Real**: Isolamento de dados forçado no backend e no banco de dados. As regras de negócio são aplicadas no backend com fallback para regiões crítica (isolamento de tenant) no banco de dados. 
 
 - **Alta Performance & Escalabilidade**:
     - Uso de Table Partitioning (via pg_partman) para tabelas volumosas (sales, sale_items, sale_payments), garantindo consultas rápidas mesmo com milhões de registros.
